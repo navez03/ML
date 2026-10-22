@@ -1,0 +1,635 @@
+from math import comb
+
+
+import numpy as np                                                                      # linear algebra
+import pandas as pd                                                                     # data processing, CSV file I/O (e.g. pd.read_csv)
+import os
+import matplotlib.pyplot as plt
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+import kagglehub
+from pathlib import Path
+from sklearn.linear_model import LinearRegression, RidgeCV
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import root_mean_squared_error
+from sklearn.pipeline import Pipeline, make_pipeline, clone
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+def plot_y_yhat(y_test,y_pred, plot_title = "plot"):                                    # Plots
+    labels = ['x_1','y_1','x_2','y_2','x_3','y_3']
+    MAX = 500
+    if len(y_test) > MAX:
+        idx = np.random.choice(len(y_test),MAX, replace=False)
+    else:
+        idx = np.arange(len(y_test))
+    plt.figure(figsize=(10,10))
+    for i in range(6):
+        x0 = np.min(y_test[idx,i])
+        x1 = np.max(y_test[idx,i])
+        plt.subplot(3,2,i+1)
+        plt.scatter(y_test[idx,i],y_pred[idx,i])
+        plt.xlabel('True '+labels[i])
+        plt.ylabel('Predicted '+labels[i])
+        plt.plot([x0,x1],[x0,x1],color='red')
+        plt.axis('square')
+    plt.savefig(plot_title+'.pdf')
+    plt.show()
+
+def train(X_train, Y_train, X_val, Y_val, selected_features):                           # StandardScaler é utilizado para realizar a normalização
+    model = Pipeline([                                                                  # Desta forma os valores deixam de estar expressos nas unidades originais e passam a indicar a sua distancia à media.
+        ("scaler", StandardScaler()),
+        ("linear_regression", LinearRegression()),
+    ])
+    model.fit(X_train[selected_features], Y_train)
+    predictions = model.predict(X_val[selected_features])
+    rmse = root_mean_squared_error(Y_val, predictions)
+    return rmse, predictions, model
+
+print("Task 1: Baseline model:")
+#task 1
+dt = pd.read_csv("C:\\Users\\vicen\\Documents\\X_train.csv")
+dt["trajectory_id"] = dt["Id"] // 257                                                   # cada trajetória ocupa 257 linhas no nosso dataset, isto cria uma nova coluna no dataset
+trajectory_ids = dt["trajectory_id"].unique()                                           # 0..4999
+train_ids, remaining_ids = train_test_split(
+    trajectory_ids,
+    test_size = 0.3,                                                                    # 30% para validation e test, 70% para treino
+    random_state=42
+)
+validation_ids, test_ids = train_test_split(
+    remaining_ids,
+    test_size= 0.5,                                                                     # 15% para cada
+    random_state=42
+)
+initial_columns = ["x_1_0", "y_1_0","x_2_0", "y_2_0","x_3_0", "y_3_0"]
+position_columns  = ["x_1", "y_1","x_2", "y_2","x_3", "y_3"]                                                   
+dt[initial_columns] = (                                                                 #target outputs, só queremos os valores iniciais
+    dt.groupby("trajectory_id")[position_columns]
+      .transform("first")
+    )
+train_data = dt[dt["trajectory_id"].isin(train_ids)]                                    # Construimos os dataframes depois de criar as colunas iniciais.
+validation_data = dt[dt["trajectory_id"].isin(validation_ids)]
+test_data = dt[dt["trajectory_id"].isin(test_ids)]
+features_columns = ["t"] + initial_columns
+target_columns = position_columns 
+x_train = train_data[features_columns]
+x_validation = validation_data[features_columns]
+x_test = test_data[features_columns]
+y_train = train_data[target_columns]
+y_validation = validation_data[target_columns]
+y_test = test_data[target_columns]
+
+baseline_rmse, baseline_predictions, baseline_model = train(x_train, y_train,           #baseline rmse
+                                    x_validation, y_validation, features_columns,)
+print(f"Baseline RMSE: {baseline_rmse:.6f}")
+plot_y_yhat(y_validation.to_numpy(),baseline_predictions,plot_title="Baseline",)
+y_predicted = baseline_model.predict(x_test)
+rmse_test = root_mean_squared_error(y_test,y_predicted)
+print(f"RMSE on test set: {rmse_test:.6f}")
+print("Task 2: Polynomial regression:")
+#Task 2
+diffs = dt.groupby("trajectory_id")[position_columns].diff()                            #check for same position in a row in the same trajectory
+colision = (diffs.abs() == 0).all(axis="columns")                                       #checks if the difference is zero
+dt = dt[~colision]                                                                      #removes the colisions
+# split by trajectory: 70% train / 15% validation / 15% test
+def split_trajectories(seed=42):                                                        #defines a seed
+    ids = dt["trajectory_id"].unique()                                                  #gets each unique id
+    train_ids, rest_ids = train_test_split(ids, test_size=0.30, random_state=seed)      #splits the data into train and the rest
+    val_ids, test_ids = train_test_split(rest_ids, test_size=0.50, random_state=seed)   #splits the rest into validation and test
+    return (dt[dt["trajectory_id"].isin(train_ids)],
+        dt[dt["trajectory_id"].isin(val_ids)], dt[dt["trajectory_id"].isin(test_ids)])  #returns the train, validation and test sets
+def make_dev_sets(train_data, val_data, seed=42, n_train=2000, n_val=1000):             #creates smaller subsets for development
+    tr = train_data.sample(n=n_train, random_state=seed)                                #samples the training data
+    va = val_data.sample(n=n_val, random_state=seed)                                    #samples the validation data
+    return (tr[features_columns], tr[target_columns],
+            va[features_columns], va[target_columns])                                   #returns the features and target columns for train and validation sets
+def validate_poly_regression(X_train, y_train, X_val, y_val, regressor=None,
+                             degrees=range(1, 15), max_features=None):
+    best_model, best_rmse = None, np.inf                                                #sets the infinite, best model and best rmse variables
+    n_inputs = X_train.shape[1]                                                         #gets the number of input features
+
+    for d in degrees:
+        expected = PolynomialFeatures(degree=d).fit(X_train.iloc[:1]).n_output_features_#checks the number of columns PolynomialFeatures will have (counted on 1 row, before fitting the model)
+        if max_features is not None and expected > max_features:
+            print(f"degree={d}  n_features={expected} -> skipped (> max_features)")
+            continue
+
+        reg = clone(regressor) if regressor is not None else LinearRegression()
+        model = make_pipeline(StandardScaler(), PolynomialFeatures(degree=d), reg)
+        model.fit(X_train, y_train)
+
+        n_feat = model.named_steps["polynomialfeatures"].n_output_features_
+        rmse = root_mean_squared_error(y_val, model.predict(X_val))
+        print(f"degree={d}  n_features={n_feat}  val RMSE={rmse:.4f}")
+
+        if rmse < best_rmse:
+            best_model, best_rmse = model, rmse
+
+    return best_model, best_rmse
+                                                                                        #overfiting risk because rmse goes up from n = 7
+def best_degree_of(model):
+    return model.named_steps["polynomialfeatures"].degree
+
+train_data, validation_data, test_data = split_trajectories(seed=42)
+x_train, y_train, x_validation, y_validation = make_dev_sets(train_data,
+                                                              validation_data, seed=42)
+
+model, best_rmse = validate_poly_regression(x_train, y_train, x_validation,
+                y_validation,regressor=None, degrees=range(1, 15), max_features=9)
+
+print("best degree:", best_degree_of(model), " RMSE:", best_rmse)
+
+ridge_model, ridge_rmse = validate_poly_regression(x_train, y_train, x_validation,
+             y_validation, regressor=RidgeCV(), degrees=range(1, 15), max_features=9)
+print("ridge best degree:", best_degree_of(ridge_model), " RMSE:", ridge_rmse)
+
+y_test = y_validation.to_numpy()                                                        # Use the validation set to compare true vs predicted positions
+y_pred = model.predict(x_validation)                                                    # Predictions from the best polynomial regression model
+
+plot_y_yhat(y_test, y_pred, plot_title="polynomial_regression")
+y_pred_ridge = ridge_model.predict(x_validation)                                        # Predictions from the best Ridge regression model
+
+plot_y_yhat(y_test, y_pred_ridge, plot_title="ridge_regression")
+
+print("Task 3: Polynomial regression with feature selection:")
+# #task 3, #3.1
+# analysis_columns = features_columns + target_columns                                    # Só temos em conta as variaveis relevantes, ou seja todas exceto as das velocidades e ID. 
+# analysis_sample = train_data[analysis_columns].sample(200, random_state=2026)
+
+# sns.pairplot(analysis_sample, kind="hist")
+# plt.show()
+
+#                                                                                         # temos de ter em conta 3 tipos de relações possiveis e o que elas demonstram:
+#                                                                                         # feature-feature, para decidir eventuais remoções
+#                                                                                         # feature- target, util para verificarmos a capacidade preditiva de uma feature.
+#                                                                                         # target-target, util para uma analise complementar
+
+
+# correlations = analysis_sample.corr()
+
+# plt.figure(figsize=(16, 12))
+# sns.heatmap(correlations,annot=True,fmt=".2f", annot_kws={"size": 7}, cmap="coolwarm",
+#              vmin=-1, vmax=1)
+# plt.show()
+
+#                                                                                         # olhando para os valores das correlações validamos a existência de algumas associações lineares
+#                                                                                         # nomeadamente x_3_0 - x_2_0 e y_3_0- y_2_0
+#                                                                                         # e depois algumas relações target-target como x3-x1 e y3-y1 por exemplo, mas temos outras.
+
+# upper_triangle=correlations.where(np.triu(np.ones(correlations.shape),k=1).astype(bool))
+
+# ordered_correlations = (upper_triangle.stack().dropna().rename("correlation")
+#                     .reset_index()
+#                     .rename(columns={"level_0": "feature_1", "level_1": "feature_2"}))
+
+# ordered_correlations["absolute_correlation"] = (
+#     ordered_correlations["correlation"].abs()
+# )
+
+# ordered_correlations = ordered_correlations.sort_values(
+#     "absolute_correlation",
+#     ascending=False,
+# )
+
+# print(ordered_correlations.to_string(index=False))
+
+#                                                                                         # Aqui é onde vamos testar a remoção de cada variavél, e avaliar o rmse
+#                                                                                         # numa fase inicial removemos uma a uma
+#                                                                                         # numa segunda fase, removemos mais do que uma.
+
+# experiments = [["x_1_0"],["y_1_0"],["x_2_0"],["y_2_0"],["x_3_0"],["y_3_0"],
+#     ["x_1_0", "y_1_0"],["x_1_0", "y_1_0", "y_2_0"],
+# ]
+
+# results = []
+
+# for removed_features in experiments:
+#     selected_features = [
+#         feature
+#         for feature in features_columns
+#         if feature not in removed_features
+#     ]
+
+#     rmse, _, _ = train(x_train,y_train,x_validation,y_validation,selected_features)
+
+#     results.append({
+#         "removed_features": removed_features,
+#         "selected_features": selected_features,
+#         "rmse": rmse,
+#         "distance_to_baseline": rmse - baseline_rmse,
+#     })
+
+# results = pd.DataFrame(results).sort_values("rmse")
+# print(results.to_string(index=False))
+
+#                                                                                         # o facto de o rsme se manter após a remoção de features mostra que elas eram redundantes e que
+#                                                                                         # conseguimos saber/aproximar o seu valor atravês de outras features, passando menos features a o modelo.
+#                                                                                         # Agora vamos comparar o baseline model, com o model com a redução das input features.
+
+
+# reduced_features = ["t", "x_2_0", "x_3_0", "y_3_0"]
+
+# reduced_rmse, reduced_predictions, reduced_model = train(
+#     x_train,
+#     y_train,
+#     x_validation,
+#     y_validation,
+#     reduced_features,
+# )
+
+# print(f"Reduced features RMSE: {reduced_rmse:.6f}")
+# print(f"Selected features: {reduced_features}")
+
+# plot_y_yhat(
+#     y_validation.to_numpy(),
+#     reduced_predictions,
+#     plot_title="Reduced features",
+# )
+
+# # verificamos que o rsme do baseline = rsme do modelo com menos features, o que signfica que existiam efetivamente 
+# # features redundantes.
+
+
+# # Fim da 3.1
+
+# # Inicio da 3.2 
+
+# # Isto vem da task2, ajustando com as reduced_features e com as normais.
+
+# def make_development_sets(n_train=2000, n_validation=1000):
+#     train_sample = train_data.sample(
+#         n=min(n_train, len(train_data)),
+#         random_state=2026,
+#     )
+#     validation_sample = validation_data.sample(
+#         n=min(n_validation, len(validation_data)),
+#         random_state=2026,
+#     )
+
+#     return (
+#         train_sample[features_columns],
+#         train_sample[reduced_features],
+#         train_sample[target_columns],
+#         validation_sample[features_columns],
+#         validation_sample[reduced_features],
+#         validation_sample[target_columns],
+#     )
+
+
+# ridge_model_reduced, ridge_rmse_reduced = validate_poly_regression(
+#     x_train_poly_reduced,
+#     y_train_poly,
+#     x_validation_poly_reduced,
+#     y_validation_poly,
+#     regressor=RidgeCV(),
+#     degrees=range(1, 9),
+# )
+
+# ridge_degree_reduced = ridge_model_reduced.named_steps["polynomialfeatures"].degree
+# ridge_predictions_reduced = ridge_model_reduced.predict(x_validation_poly_reduced)
+    
+# print(f"Best Ridge degree reduced : {ridge_degree_reduced}")
+# print(f"Best Ridge validation RMSE reduced: {ridge_rmse_reduced:.6f}")
+
+
+# plot_y_yhat(
+#     y_validation_poly.to_numpy(),
+#     ridge_predictions_reduced,
+#     plot_title="Task 3.2 - Polynomial Ridge with reduced features",
+# )
+
+# def predict_in_batches(model, X, batch_size=512):
+#     parts = []
+
+#     for start in range(0, len(X), batch_size):
+#         batch = X.iloc[start:start + batch_size]
+#         parts.append(model.predict(batch))
+
+#     return np.vstack(parts)
+
+
+# x_test_local = test_data[reduced_features]
+# y_test_local = test_data[target_columns]
+
+# pred_test_local = predict_in_batches(
+#     ridge_model_reduced,
+#     x_test_local,
+# )
+
+# test_rmse = root_mean_squared_error(
+#     y_test_local,
+#     pred_test_local,
+# )
+
+# print(f"Grau escolhido: {ridge_degree_reduced}")
+# print(f"RMSE no teste local: {test_rmse:.4f}")
+
+# plot_y_yhat(
+#     y_test_local.to_numpy(),
+#     pred_test_local,
+#     plot_title="Task 3.2 - Local test",
+# )
+# X_kaggle = pd.read_csv(
+#     "/kaggle/input/competitions/"
+#     "task-3-machine-learning-nova-2026-the-three-body-problem/"
+#     "mlNOVA/mlNOVA/X_test.csv"
+# )
+
+# X_kaggle_features = X_kaggle.rename(columns={
+#     "x0_1": "x_1_0",
+#     "y0_1": "y_1_0",
+#     "x0_2": "x_2_0",
+#     "y0_2": "y_2_0",
+#     "x0_3": "x_3_0",
+#     "y0_3": "y_3_0",
+# })[reduced_features]
+
+# prediction = predict_in_batches(
+#     ridge_model_reduced,
+#     X_kaggle_features,
+# )
+
+# submission = pd.DataFrame(
+#     prediction,
+#     columns=position_columns,
+# )
+# submission.insert(0, "Id", X_kaggle["Id"].to_numpy())
+
+# assert submission.shape == (1_041_621, 7)
+# assert np.isfinite(submission[position_columns].to_numpy()).all()
+
+# submission.to_csv(
+#     "/kaggle/working/submission.csv",
+#     index=False,
+# )
+
+
+# Fim da task 2 
+# # Inicio da task3
+
+# # vamos ter criar novas features.
+# # uma delas será no caso a distancia entre dois corpos
+# # a segunda o inversa dessa distancia
+# # o inverso dessa disancia ao quadrado
+
+
+# # função responsavél pro adicionar as colunas das novas features ao respetivo df.
+# def add_engineered_features(data):
+    
+#     result = data.copy()
+#     epsilon = 1e-8
+
+#     pairs = [(1, 2), (1, 3), (2, 3)]
+
+#     for body_1, body_2 in pairs:
+        
+#         difference_x = (
+#             result[f"x_{body_1}_0"] - result[f"x_{body_2}_0"]
+#         )
+#         difference_y = (
+#             result[f"y_{body_1}_0"] - result[f"y_{body_2}_0"]
+#         )
+
+#         distance = np.sqrt(difference_x**2 + difference_y**2)
+#         distance_name = f"r_{body_1}{body_2}_0"
+
+#         result[distance_name] = distance
+#         result[f"inv_{distance_name}"] = 1 / (distance + epsilon)
+#         result[f"inv2_{distance_name}"] = 1 / (distance**2 + epsilon)
+
+#     return result
+    
+
+# train_data = add_engineered_features(train_data)
+# validation_data = add_engineered_features(validation_data)
+# test_data = add_engineered_features(test_data)
+
+# distance_features = ["r_12_0", "r_13_0", "r_23_0"]
+
+# inverse_distance_features = [
+#     "inv_r_12_0", "inv_r_13_0", "inv_r_23_0",
+# ]
+# inverse_squared_features = [
+#     "inv2_r_12_0", "inv2_r_13_0", "inv2_r_23_0",
+# ]
+# feature_engineering_experiments = {
+#     "Reduced baseline": reduced_features,
+#     "Distances": reduced_features + distance_features,
+#     "Inverse distances": reduced_features + inverse_distance_features,
+#     "Inverse squared distances": reduced_features + inverse_squared_features,
+# }
+
+# feature_engineering_results = []
+
+# for experiment_name, experiment_features in feature_engineering_experiments.items():
+#     rmse, predictions, model = train(
+#         train_data,
+#         y_train,
+#         validation_data,
+#         y_validation,
+#         experiment_features,
+#     )
+
+#     feature_engineering_results.append({
+#         "experiment": experiment_name,
+#         "features": experiment_features,
+#         "rmse": rmse,
+#         "distance_to_reduced_baseline": rmse - reduced_rmse,
+#     })
+
+#     plot_y_yhat(
+#         y_validation.to_numpy(),
+#         predictions,
+#         plot_title=f"Task 3.3 - {experiment_name}",
+#     )
+
+# feature_engineering_results = pd.DataFrame(
+#     feature_engineering_results
+# ).sort_values("rmse")
+
+# print(feature_engineering_results.to_string(index=False))
+
+# # Fim da task 3.3
+# # Inicio da task 3.4
+
+# # ColumnTransformer -> decide quais das colunas é que vão passar pelas trasnformações e junta os resultados numa matriz
+# # FunctionTransformer -> responsavél por calcular as novas features, neste caso r_12, r_13, r_23
+
+# # Este processo afeta essencialmente a pipeline que antes computava somente as PolynomialFeatures e agora
+# # vai adicionar estas transformações à pipeline
+
+# # Função para calcular as distancias, FunctionTransformer vai chamar esta função.
+
+# from sklearn.preprocessing import FunctionTransformer, PolynomialFeatures, StandardScaler
+# from sklearn.compose import ColumnTransformer
+
+
+# def calculate_distances(X):
+#     distance_12 = np.sqrt(
+#         (X["x_1_0"] - X["x_2_0"])**2
+#         + (X["y_1_0"] - X["y_2_0"])**2
+#     )
+#     distance_13 = np.sqrt(
+#         (X["x_1_0"] - X["x_3_0"])**2
+#         + (X["y_1_0"] - X["y_3_0"])**2
+#     )
+#     distance_23 = np.sqrt(
+#         (X["x_2_0"] - X["x_3_0"])**2
+#         + (X["y_2_0"] - X["y_3_0"])**2
+#     )
+
+#     return np.column_stack([
+#         distance_12,
+#         distance_13,
+#         distance_23,
+#     ])
+
+
+# def validate_augmented_poly_regression(
+#     X_train,
+#     y_train,
+#     X_val,
+#     y_val,
+#     regressor=None,
+#     degrees=range(1, 9),
+# ):
+#     best_model, best_rmse = None, np.inf
+
+#     for degree in degrees:
+
+#         # passo da pipeline para a polinomial_regression.
+#         polynomial_transformer = make_pipeline(
+#             StandardScaler(),
+#             PolynomialFeatures(degree=degree),
+#         )
+
+#         # pipeline para aplicar o functionTransformer para obtermos as distancias.
+#         distance_transformer = make_pipeline(
+#             FunctionTransformer(calculate_distances),
+#             StandardScaler(), # aplica a normalização depois de calcular as distancias
+#         )
+
+
+#         # permite diferenciar as colunas que afeta. 
+#         preprocessor = ColumnTransformer([
+#             (
+#                 "polynomial",
+#                 polynomial_transformer,
+#                 reduced_features,
+#             ),
+#             (
+#                 "distances",
+#                 distance_transformer,
+#                 initial_columns,
+#             ),
+#         ])
+
+#         reg = clone(regressor) if regressor is not None else LinearRegression()
+#         # são criados dois ramos, e juntos numa só pipeline
+#         model = make_pipeline(preprocessor, reg)
+
+#         model.fit(X_train, y_train)
+#         predictions = model.predict(X_val)
+#         rmse = root_mean_squared_error(y_val, predictions)
+
+#         polynomial_pipeline = (
+#             model.named_steps["columntransformer"]
+#             .named_transformers_["polynomial"]
+#         )
+#         polynomial_count = (
+#             polynomial_pipeline
+#             .named_steps["polynomialfeatures"]
+#             .n_output_features_
+#         )
+#         total_features = polynomial_count + len(distance_features)
+
+#         print(
+#             f"degree={degree} "
+#             f"n_features={total_features} "
+#             f"val RMSE={rmse:.6f}"
+#         )
+
+#         if rmse < best_rmse:
+#             best_model = model
+#             best_rmse = rmse
+
+#     return best_model, best_rmse
+
+
+# augmented_model, augmented_rmse = validate_augmented_poly_regression(
+#     x_train_poly_all,
+#     y_train_poly,
+#     x_validation_poly_all,
+#     y_validation_poly,
+#     regressor=RidgeCV(),
+#     degrees=range(1, 9),
+# )
+
+# augmented_predictions = augmented_model.predict(x_validation_poly_all)
+
+# augmented_polynomial_pipeline = (
+#     augmented_model.named_steps["columntransformer"]
+#     .named_transformers_["polynomial"]
+# )
+# augmented_degree = (
+#     augmented_polynomial_pipeline
+#     .named_steps["polynomialfeatures"]
+#     .degree
+# )
+
+# print(f"Best augmented degree: {augmented_degree}")
+# print(f"Best augmented validation RMSE: {augmented_rmse:.6f}")
+
+# plot_y_yhat(
+#     y_validation_poly.to_numpy(),
+#     augmented_predictions,
+#     plot_title="Task 3.4 - Polynomial Ridge with distances",
+# )
+
+# print("\nModel comparison")
+# print(f"Task 2 - all features: {ridge_rmse_all:.6f}")
+# print(f"Task 3.2 - reduced features: {ridge_rmse_reduced:.6f}")
+# print(f"Task 3.4 - augmented features: {augmented_rmse:.6f}")
+
+# # Submission
+
+# X_kaggle = pd.read_csv("/kaggle/input/competitions/"
+# "task-3-machine-learning-nova-2026-the-three-body-problem/"
+# "mlNOVA/mlNOVA/X_test.csv"
+# )
+
+
+# X_kaggle_features = X_kaggle.rename(columns={
+#     "x0_1": "x_1_0",
+#     "y0_1": "y_1_0",
+#     "x0_2": "x_2_0",
+#     "y0_2": "y_2_0",
+#     "x0_3": "x_3_0",
+#     "y0_3": "y_3_0",
+# })[features_columns]
+
+# prediction = predict_in_batches(
+#     augmented_model,
+#     X_kaggle_features,
+# )
+
+# submission_augmented = pd.DataFrame(
+#     prediction,
+#     columns=position_columns,
+# )
+# submission_augmented.insert(
+#     0,
+#     "Id",
+#     X_kaggle["Id"].to_numpy(),
+# )
+
+# assert submission_augmented.shape == (1_041_621, 7)
+# assert np.isfinite(
+#     submission_augmented[position_columns].to_numpy()
+# ).all()
+
+# submission_augmented.to_csv(
+#     "/kaggle/working/submission.csv",
+#     index=False,
+# )
+
+# # Fim da task 3.4
